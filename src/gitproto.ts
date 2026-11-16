@@ -256,10 +256,11 @@ function planFetch(forge: Forge, repo: RepoRec, request: FetchRequest): FetchPla
     const [oid, depth] = queue.shift()!;
     if (dist.has(oid) && dist.get(oid)! <= depth) continue;
     dist.set(oid, depth);
-    // The walk never stops early: generation distances must reach through
-    // held commits to the shallow boundary and beyond, or a relative deepen
-    // cannot be measured. Held commits are excluded when the send set is
-    // built, not here.
+    // For a plain depth-limited fetch, nothing at distance >= depth can be
+    // sent or measured, so the walk stops at the last included generation.
+    // (A relative deepen is exempt: the boundary's own distance must be
+    // measured through held commits first.)
+    if (request.depth !== undefined && !request.deepenRelative && depth >= request.depth - 1) continue;
     const object = lookup(oid);
     if (object === undefined || object.type !== 'commit') continue;
     for (const parent of parseCommit(object.data).parents) {
