@@ -37,7 +37,7 @@ export interface GitResponse {
 }
 
 const AGENT = 'forge/1.0';
-const UPLOAD_CAPS_V0 = `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow agent=${AGENT}`;
+const UPLOAD_CAPS_V0 = `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-relative agent=${AGENT}`;
 const RECEIVE_CAPS_V0 = `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
 
 function jsonError(status: number, message: string): GitResponse {
@@ -126,7 +126,11 @@ function lsRefsLines(forge: Forge, repo: RepoRec, args: readonly string[]): stri
   const lines: string[] = [];
   const headName = headRefName(repo);
   const headTip = forge.headTip(repo);
-  if (prefixes.length === 0) {
+  // HEAD is a pseudo-ref in the answer: present when no prefixes were given,
+  // or when a prefix matches HEAD's own name (a clone asks for exactly that,
+  // with "ref-prefix HEAD"); a bare refs/heads/ prefix does not pull it in.
+  const headWanted = prefixes.length === 0 || prefixes.some((prefix) => 'HEAD'.startsWith(prefix));
+  if (headWanted) {
     if (headTip !== null) {
       lines.push(`${headTip} HEAD${wantSymrefs ? ` symref-target:${headName}` : ''}\n`);
     } else if (wantUnborn) {
@@ -152,6 +156,10 @@ interface FetchRequest {
   haves: string[];
   shallow: string[];
   depth: number | undefined;
+  /** A 'deepen' counted from the client's current depth, not from the want. */
+  deepenRelative: boolean;
+  /** Whether the client closed negotiation with 'done' in this request. */
+  done: boolean;
 }
 
 interface FetchPlan {
@@ -161,6 +169,8 @@ interface FetchPlan {
   unshallowLines: string[];
   /** A have the client and server share, for the ACK line; null for NAK. */
   common: string | null;
+  /** Every have that names a commit the server holds, in request order. */
+  commonHaves: string[];
 }
 
 /**
@@ -172,16 +182,48 @@ interface FetchPlan {
  */
 function planFetch(forge: Forge, repo: RepoRec, request: FetchRequest): FetchPlan {
   const lookup = forge.lookup(repo);
-  const shallowSet = new Set(request.shallow.filter((oid) => isOid(oid)));
-  const fullHaves = request.haves.filter((oid) => isOid(oid) && !shallowSet.has(oid) && lookup(oid)?.type === 'commit');
-  const heldFull = closureOf(lookup, fullHaves);
-  const heldFullCommits = new Set([...heldFull].filter((oid) => lookup(oid)?.type === 'commit'));
-  const heldShallow = new Set<string>();
-  for (const oid of shallowSet) {
+  const shallowSet = new Set(request.shallow.filter((oid) => isOid(oid) && lookup(oid)?.type === 'commit'));
+  const haves = request.haves.filter((oid) => isOid(oid) && lookup(oid)?.type === 'commit');
+
+  // What the client already holds: every ancestor of a have, but grafted at
+  // the shallow boundary — a commit named in a 'shallow' line is held itself,
+  // its parents are not. Held objects are the held commits plus their trees.
+  const heldCommits = new Set<string>();
+  {
+    const stack = [...haves];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (heldCommits.has(oid)) continue;
+      heldCommits.add(oid);
+      if (shallowSet.has(oid)) continue;
+      const object = lookup(oid);
+      if (object !== undefined && object.type === 'commit') stack.push(...parseCommit(object.data).parents);
+    }
+  }
+  const heldObjects = new Set<string>(heldCommits);
+  for (const oid of heldCommits) {
     const object = lookup(oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    heldShallow.add(oid);
-    addTreeClosure(lookup, parseCommit(object.data).tree, heldShallow);
+    if (object !== undefined && object.type === 'commit') addTreeClosure(lookup, parseCommit(object.data).tree, heldObjects);
+  }
+
+  // Everything strictly below the client's shallow boundary. An unbounded
+  // fetch (no depth requested) must not send any of it — the client grafts
+  // its boundary and cannot link deeper history; a fetch with a depth (a
+  // deepen, or deepen-2147483647 for --unshallow) may.
+  const belowBoundary = new Set<string>();
+  {
+    const stack: string[] = [];
+    for (const oid of shallowSet) {
+      const object = lookup(oid);
+      if (object !== undefined && object.type === 'commit') stack.push(...parseCommit(object.data).parents);
+    }
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (belowBoundary.has(oid) || shallowSet.has(oid)) continue;
+      belowBoundary.add(oid);
+      const object = lookup(oid);
+      if (object !== undefined && object.type === 'commit') stack.push(...parseCommit(object.data).parents);
+    }
   }
 
   // Breadth-first walk from the wants, tracking generation distance. Tags on
@@ -210,24 +252,40 @@ function planFetch(forge: Forge, repo: RepoRec, request: FetchRequest): FetchPla
     }
   };
   for (const want of request.wants) if (isOid(want)) seedCommit(want, 0);
-  const visited = new Map<string, number>();
   while (queue.length > 0) {
     const [oid, depth] = queue.shift()!;
-    if (visited.has(oid) && visited.get(oid)! <= depth) continue;
-    visited.set(oid, depth);
-    if (heldFull.has(oid)) continue;
-    if (request.depth !== undefined && depth >= request.depth) continue;
+    if (dist.has(oid) && dist.get(oid)! <= depth) continue;
+    dist.set(oid, depth);
+    // The walk never stops early: generation distances must reach through
+    // held commits to the shallow boundary and beyond, or a relative deepen
+    // cannot be measured. Held commits are excluded when the send set is
+    // built, not here.
     const object = lookup(oid);
     if (object === undefined || object.type !== 'commit') continue;
     for (const parent of parseCommit(object.data).parents) {
-      if (!visited.has(parent) || visited.get(parent)! > depth + 1) queue.push([parent, depth + 1]);
+      if (!dist.has(parent) || dist.get(parent)! > depth + 1) queue.push([parent, depth + 1]);
     }
   }
 
+  // The effective depth: the requested depth, or — for a relative deepen —
+  // the depth the client's shallow boundary already sits at, plus the
+  // requested increment. A depth of N includes N generations (distances
+  // 0..N-1 from a want).
+  let effectiveDepth = request.depth;
+  if (request.depth !== undefined && request.deepenRelative) {
+    let current = 1;
+    for (const oid of shallowSet) {
+      const at = dist.get(oid);
+      if (at !== undefined) current = Math.max(current, at + 1);
+    }
+    effectiveDepth = current + request.depth;
+  }
+
   const sendCommits = new Set<string>();
-  for (const [oid, depth] of visited) {
-    if (request.depth !== undefined && depth > request.depth) continue;
-    if (heldFull.has(oid) || heldShallow.has(oid)) continue;
+  for (const [oid, depth] of dist) {
+    if (effectiveDepth !== undefined && depth >= effectiveDepth) continue;
+    if (heldCommits.has(oid)) continue;
+    if (request.depth === undefined && belowBoundary.has(oid)) continue;
     sendCommits.add(oid);
   }
 
@@ -238,23 +296,23 @@ function planFetch(forge: Forge, repo: RepoRec, request: FetchRequest): FetchPla
     if (commit !== undefined && commit.type === 'commit') addTreeClosure(lookup, parseCommit(commit.data).tree, send);
   }
   for (const oid of tagObjects) {
-    if (!heldFull.has(oid) && !heldShallow.has(oid)) send.add(oid);
+    if (!heldObjects.has(oid)) send.add(oid);
   }
-  for (const oid of heldFull) send.delete(oid);
-  for (const oid of heldShallow) send.delete(oid);
+  for (const oid of heldObjects) send.delete(oid);
 
   // The shallow boundary: sent commits with a parent the client will not
   // hold in full after this fetch. Only meaningful when the fetch is shallow
   // (a depth was requested, or the client already carries a boundary).
   const shallowLines: string[] = [];
   const unshallowLines: string[] = [];
-  if (request.depth !== undefined || shallowSet.size > 0) {
+  if (effectiveDepth !== undefined || shallowSet.size > 0) {
     const boundary = new Set<string>();
     for (const oid of sendCommits) {
       const commit = lookup(oid);
       if (commit === undefined || commit.type !== 'commit') continue;
       for (const parent of parseCommit(commit.data).parents) {
-        if (lookup(parent) !== undefined && !sendCommits.has(parent) && !heldFullCommits.has(parent)) boundary.add(oid);
+        const solidlyHeld = heldCommits.has(parent) && !shallowSet.has(parent);
+        if (lookup(parent) !== undefined && !sendCommits.has(parent) && !solidlyHeld) boundary.add(oid);
       }
     }
     for (const oid of boundary) if (!shallowSet.has(oid)) shallowLines.push(`shallow ${oid}\n`);
@@ -263,7 +321,8 @@ function planFetch(forge: Forge, repo: RepoRec, request: FetchRequest): FetchPla
       const commit = lookup(oid);
       if (commit === undefined || commit.type !== 'commit') continue;
       const parents = parseCommit(commit.data).parents;
-      if (sendCommits.has(oid) || parents.some((parent) => sendCommits.has(parent))) unshallowLines.push(`unshallow ${oid}\n`);
+      const delivered = sendCommits.has(oid) || parents.some((parent) => sendCommits.has(parent));
+      if (delivered) unshallowLines.push(`unshallow ${oid}\n`);
     }
   }
 
@@ -276,43 +335,112 @@ function planFetch(forge: Forge, repo: RepoRec, request: FetchRequest): FetchPla
   for (const oid of send) if (!sendCommits.has(oid)) pushObject(oid);
 
   let common: string | null = null;
+  const commonHaves: string[] = [];
   for (const have of request.haves) {
-    if (isOid(have) && lookup(have)?.type === 'commit') common = have;
+    if (isOid(have) && lookup(have)?.type === 'commit') {
+      common = have;
+      commonHaves.push(have);
+    }
   }
-  return { objects, shallowLines, unshallowLines, common };
+  return { objects, shallowLines, unshallowLines, common, commonHaves };
 }
 
-/** The v2 fetch answer: acknowledgments, shallow-info, then the packfile section. */
-function fetchResponseV2(plan: FetchPlan): Buffer {
+/**
+ * The v2 fetch answer, in the shapes the protocol's state machine allows:
+ *
+ *   - haves but no 'done', and nothing in common: an acknowledgments section
+ *     carrying only NAK — negotiation continues in the client's next request,
+ *     and no other section may follow.
+ *   - haves but no 'done', with a common commit: acknowledgments with an ACK
+ *     per common have and 'ready', then — in the same answer — shallow-info
+ *     when the boundary moved and a packfile section (an empty pack when
+ *     there is nothing new: after 'ready' the packfile must come).
+ *   - 'done' sent (a clone, or a client that negotiates in one request): no
+ *     acknowledgments at all; shallow-info and packfile sections only, the
+ *     packfile omitted when there are no objects to send.
+ */
+function fetchResponseV2(plan: FetchPlan, request: FetchRequest): Buffer {
+  const joinSections = (sections: Buffer[][]): Buffer => {
+    const parts: Buffer[] = [];
+    sections.forEach((section, index) => {
+      parts.push(...section);
+      parts.push(index === sections.length - 1 ? pktFlush() : delimPacket());
+    });
+    return Buffer.concat(parts);
+  };
+  const shallowSection = (): Buffer[] | null => {
+    const lines = [...plan.shallowLines, ...plan.unshallowLines];
+    return lines.length === 0 ? null : [pktLine('shallow-info\n'), ...lines.map((line) => pktLine(line))];
+  };
+
+  if (!request.done && request.haves.length > 0) {
+    if (plan.commonHaves.length === 0) {
+      return joinSections([[pktLine('acknowledgments\n'), pktLine('NAK\n')]]);
+    }
+    const ackLines = [...plan.commonHaves.map((have) => `ACK ${have}\n`), 'ready\n'];
+    const sections: Buffer[][] = [[pktLine('acknowledgments\n'), ...ackLines.map((line) => pktLine(line))]];
+    const shallow = shallowSection();
+    if (shallow !== null) sections.push(shallow);
+    sections.push([pktLine('packfile\n'), ...sidebandWrap(buildPack(plan.objects))]);
+    return joinSections(sections);
+  }
+
   const sections: Buffer[][] = [];
-  const ackLines = [plan.common !== null ? `ACK ${plan.common}\n` : 'NAK\n'];
-  sections.push([pktLine('acknowledgments\n'), ...ackLines.map((line) => pktLine(line))]);
-  const shallowInfo = [...plan.shallowLines, ...plan.unshallowLines];
-  if (shallowInfo.length > 0) {
-    sections.push([pktLine('shallow-info\n'), ...shallowInfo.map((line) => pktLine(line))]);
-  }
+  const shallow = shallowSection();
+  if (shallow !== null) sections.push(shallow);
   if (plan.objects.length > 0) {
-    const pack = buildPack(plan.objects);
-    sections.push([pktLine('packfile\n'), ...sidebandWrap(pack)]);
+    sections.push([pktLine('packfile\n'), ...sidebandWrap(buildPack(plan.objects))]);
   }
-  const parts: Buffer[] = [];
-  sections.forEach((section, index) => {
-    parts.push(...section);
-    parts.push(index === sections.length - 1 ? pktFlush() : delimPacket());
-  });
-  return Buffer.concat(parts);
+  if (sections.length === 0) return pktFlush();
+  return joinSections(sections);
 }
 
 function delimPacket(): Buffer {
   return Buffer.from('0001', 'ascii');
 }
 
-/** The v0 fetch answer: shallow lines, a NAK, then sideband-64k pack packets. */
-function fetchResponseV0(plan: FetchPlan): Buffer {
+/**
+ * The v0 fetch answer. Over stateless RPC a deepen exchange is several
+ * requests, and the client reads each answer in a fixed order (fetch-pack's
+ * find_common): after a wants block it reads a shallow list closed by a
+ * flush; after every have block another shallow list, then ACK/NAK lines;
+ * after 'done' a final shallow list, one ACK/NAK, then the sideband pack.
+ * Bytes left unread poison the next read, so each phase gets exactly its
+ * own shape. A plain (non-deepen) fetch negotiates in a single request and
+ * expects the ACK/NAK first, then the pack.
+ */
+function fetchResponseV0(plan: FetchPlan, request: FetchRequest): Buffer {
+  const shallowLines = [...plan.shallowLines, ...plan.unshallowLines];
+  const shallowBlock = (): Buffer[] =>
+    shallowLines.length === 0 ? [] : [...shallowLines.map((line) => pktLine(line)), pktFlush()];
+  const ackLine = plan.common !== null ? `ACK ${plan.common}\n` : 'NAK\n';
+  const deepen = request.depth !== undefined;
+
+  if (!request.done) {
+    if (deepen && request.haves.length === 0) {
+      // The wants-only request of a deepen exchange: the shallow list alone.
+      return Buffer.concat(shallowBlock());
+    }
+    if (request.haves.length > 0) {
+      // A negotiation round: no pack yet. The answer is the shallow list
+      // (deepen exchanges only), an ACK-common per common have, an ACK-ready
+      // when every have was common (this server can always build the pack
+      // from a common base), and a closing NAK — the client's ACK loop reads
+      // until a NAK or a plain ACK, so the block must end with one.
+      const parts = deepen ? shallowBlock() : [];
+      for (const have of plan.commonHaves) parts.push(pktLine(`ACK ${have} common\n`));
+      const everyHaveCommon = plan.commonHaves.length === request.haves.filter((oid) => isOid(oid)).length;
+      if (plan.commonHaves.length > 0 && everyHaveCommon) {
+        parts.push(pktLine(`ACK ${plan.commonHaves[plan.commonHaves.length - 1]} ready\n`));
+      }
+      parts.push(pktLine('NAK\n'));
+      return Buffer.concat(parts);
+    }
+  }
+
   const parts: Buffer[] = [];
-  for (const line of plan.shallowLines) parts.push(pktLine(line));
-  for (const line of plan.unshallowLines) parts.push(pktLine(line));
-  parts.push(pktLine(plan.common !== null ? `ACK ${plan.common}\n` : 'NAK\n'));
+  if (deepen) parts.push(...shallowBlock());
+  parts.push(pktLine(ackLine));
   if (plan.objects.length > 0) {
     parts.push(...sidebandWrap(buildPack(plan.objects)));
   }
@@ -321,12 +449,21 @@ function fetchResponseV0(plan: FetchPlan): Buffer {
 }
 
 function parseFetchArgs(args: readonly string[]): FetchRequest {
-  const request: FetchRequest = { wants: [], haves: [], shallow: [], depth: undefined };
+  const request: FetchRequest = { wants: [], haves: [], shallow: [], depth: undefined, deepenRelative: false, done: false };
   for (const arg of args) {
-    if (arg.startsWith('want ')) request.wants.push(arg.slice(5).trim());
-    else if (arg.startsWith('have ')) request.haves.push(arg.slice(5).trim());
+    // The v0 request rides its capabilities on the first want line, after a
+    // NUL (or space) separator — the oid is only the first token, and a
+    // 'deepen-relative' capability token may hide in the remainder.
+    if (arg.startsWith('want ')) {
+      const tokens = arg.slice(5).split(/[\s\0]+/).filter((token) => token.length > 0);
+      request.wants.push(tokens[0]!);
+      if (tokens.includes('deepen-relative')) request.deepenRelative = true;
+    }
+    else if (arg.startsWith('have ')) request.haves.push(arg.slice(5).split(/[\s\0]/)[0]!);
     else if (arg.startsWith('shallow ')) request.shallow.push(arg.slice(8).trim());
     else if (arg.startsWith('deepen ')) request.depth = Number(arg.slice(7).trim());
+    else if (arg === 'deepen-relative') request.deepenRelative = true;
+    else if (arg === 'done') request.done = true;
   }
   return request;
 }
@@ -347,8 +484,9 @@ export function handleUploadPack(forge: Forge, repo: RepoRec | undefined, body: 
       return { status: 200, contentType: resultType, body: pktLines(lsRefsLines(forge, repo, decoded.args)) };
     }
     if (command === 'fetch') {
-      const plan = planFetch(forge, repo, parseFetchArgs(decoded.args));
-      return { status: 200, contentType: resultType, body: fetchResponseV2(plan) };
+      const request = parseFetchArgs(decoded.args);
+      const plan = planFetch(forge, repo, request);
+      return { status: 200, contentType: resultType, body: fetchResponseV2(plan, request) };
     }
     return jsonError(400, `unknown command ${command ?? ''}`);
   }
@@ -373,10 +511,11 @@ export function handleUploadPack(forge: Forge, repo: RepoRec | undefined, body: 
     const line = packet.replace(/\n$/, '');
     const space = line.indexOf(' ');
     const head = space === -1 ? line : line.slice(0, space);
-    if (head === 'want' || head === 'have' || head === 'shallow' || head === 'deepen') args.push(line);
+    if (head === 'want' || head === 'have' || head === 'shallow' || head === 'deepen' || head === 'done') args.push(line);
   }
-  const plan = planFetch(forge, repo, parseFetchArgs(args));
-  return { status: 200, contentType: resultType, body: fetchResponseV0(plan) };
+  const request = parseFetchArgs(args);
+  const plan = planFetch(forge, repo, request);
+  return { status: 200, contentType: resultType, body: fetchResponseV0(plan, request) };
 }
 
 // ---------------------------------------------------------------- receive-pack

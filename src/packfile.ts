@@ -65,11 +65,14 @@ interface RawEntry {
 
 /** Inflate one entry's payload starting at `pos`; answers the bytes and the offset just past them. */
 function inflateEntry(pack: Buffer, pos: number): { data: Buffer; next: number } {
+  // inflateSync with {info: true} hands back the stream itself as `engine`;
+  // its bytesWritten is exactly how many input bytes the deflate stream
+  // consumed, which is where the next pack entry begins.
   const result = inflateSync(pack.subarray(pos), { info: true }) as unknown as {
     buffer: Buffer;
-    engine: { bytesRead: number };
+    engine: { bytesWritten: number };
   };
-  return { data: result.buffer, next: pos + result.engine.bytesRead };
+  return { data: result.buffer, next: pos + result.engine.bytesWritten };
 }
 
 /** Parse a pack's raw entries without resolving deltas. Throws on any structural problem. */
